@@ -285,6 +285,68 @@ controller 层是系统的接口入口，而 service 层则承载具体的业务
 > 📌 前端部分本文不做深入展开，后续会结合具体场景简单说明。
 
 
+#### 3.1.2 Sky Take Out：一个较为常见的 Java / SpringBoot 外卖小程序教学项目
+
+在 3.1.1 中，我们已经介绍了常见项目结构以及需要重点关注的模块。在这个项目中，整体结构并没有本质变化，但**分层更加清晰、模块拆分更加细致**。
+
+
+```
+sky-take-out-main
+├── .vscode
+├── demo
+├── sky-common
+│   └── src/main/java/com/sky
+│       ├── constant        // 常量类
+│       ├── context         // 上下文（如ThreadLocal等）
+│       ├── enumeration     // 枚举类
+│       ├── exception       // 自定义异常
+│       ├── json            // JSON处理
+│       ├── properties      // 配置属性类
+│       ├── result          // 返回结果封装
+│       └── utils           // 工具类
+│
+├── sky-pojo
+│   └── src/main/java/com/sky
+│       ├── dto             // 数据传输对象（接收前端参数）
+│       ├── entity          // 实体类（数据库表映射）
+│       └── vo              // 视图对象（返回给前端）
+│
+└── sky-server
+    └── src/main/java/com/sky
+        ├── annotation      // 自定义注解
+        ├── aspect          // AOP切面
+        ├── config          // 配置类（Spring配置等）
+        ├── controller      // 控制层
+        ├── handler         // 处理器（如全局异常处理）
+        ├── interceptor     // 拦截器
+        ├── mapper          // MyBatis接口
+        ├── service         // 业务逻辑层
+        ├── task            // 定时任务
+        ├── websocket       // WebSocket相关
+        └── SkyApplication  // 启动类
+```
+
+主要的不同点在于：
+
+- 将通用能力单独拆分为 `sky-common` 模块
+  - 包含工具类、常量、上下文（ThreadLocal）、返回封装等
+  - ⭐ 审计时需要额外关注这些“公共能力”是否被不当使用，例如一些默认密码、通用逻辑可能会在这一层定义
+
+- 将数据结构单独拆分为 `sky-pojo` 模块
+  - 明确区分 `dto`（输入）、`entity`（数据库）、`vo`（输出）
+  - ⭐ 更方便梳理数据流向，但也需要关注数据在不同层之间传递时，是否进行了必要的校验与过滤
+
+- 核心业务集中在 `sky-server` 模块
+  - 包含 controller / service / mapper 等典型结构
+  - 同时引入了 AOP、拦截器、WebSocket、定时任务等机制
+  - ⭐ 审计范围更广，不仅需要关注接口本身，还需要注意切面、任务等“非直接入口”的执行逻辑
+
+总体来说，相比 3.1.1，这类项目：
+
+ 结构更加规范的项目，往往也意味着逻辑被拆分得更加分散。在审计时，需要花费更多精力跨模块跟踪调用链进行分析，否则容易遗漏细节，从而产生误判。
+
+> 一个典型的例子是审计日志（这里指系统自身记录的操作日志）：相关信息（如操作人）的填充，可能是在 AOP 中统一完成的，而不是直接出现在 controller 或 service 层。因此，不能仅凭这两层代码中“没有体现”就判断审计日志存在缺失。
+
 #### 3.2 全局配置与安全基线（配置类）
 
 
