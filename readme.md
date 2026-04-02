@@ -240,7 +240,7 @@ controller 层是系统的接口入口，而 service 层则承载具体的业务
 
 **⑤ utils**
 
-这一层在一些项目中也可能被称为 `common`，主要用于存放通用工具类。例如：
+这一层在一些项目中也可能被称为 `common`，或者被放`common`包下，主要用于存放通用工具类。例如：
 
 - 文件上传工具类（如常见的小项目中封装的 OSS 上传逻辑）
 - HTML 过滤工具类
@@ -350,14 +350,648 @@ sky-take-out-main
 #### 3.2 全局配置与安全基线（配置类）
 
 
+
+
+
 #### 3.3 认证与权限机制（登录接口 + 权限控制代码）
 
 
 #### 3.4 数据库与数据安全（DAO层 / Mapper / Repository）
 
 
-#### 3.5 工具类（文件上传 / HTML过滤 / HTTP请求等）
+#### 3.5 工具类（文件上传 / HTML过滤 / JWT等）
 
+在这一步里，我来举几个开源教学项目之中最常出现的漏洞。分析存在漏洞的写法和安全的写法（或说修复方案）
+
+
+##### 3.5.1 文件上传
+
+这是一个基于阿里OSS的文件上传工具类，观察这个代码，问题在哪里？
+
+```java
+
+@Data
+@AllArgsConstructor
+@Slf4j
+public class AliOssUtil {
+
+    private String endpoint;
+    private String accessKeyId;
+    private String accessKeySecret;
+    private String bucketName;
+
+    /**
+     * 文件上传
+     *
+     * @param bytes
+     * @param objectName
+     * @return
+     */
+    public String upload(byte[] bytes, String objectName) {
+
+        // 创建OSSClient实例。
+        OSS ossClient = new OSSClientBuilder().build(endpoint, accessKeyId, accessKeySecret);
+
+        try {
+            // 创建PutObject请求。
+            ossClient.putObject(bucketName, objectName, new ByteArrayInputStream(bytes));
+        } catch (OSSException oe) {
+            System.out.println("Caught an OSSException, which means your request made it to OSS, "
+                    + "but was rejected with an error response for some reason.");
+            System.out.println("Error Message:" + oe.getErrorMessage());
+            System.out.println("Error Code:" + oe.getErrorCode());
+            System.out.println("Request ID:" + oe.getRequestId());
+            System.out.println("Host ID:" + oe.getHostId());
+        } catch (ClientException ce) {
+            System.out.println("Caught an ClientException, which means the client encountered "
+                    + "a serious internal problem while trying to communicate with OSS, "
+                    + "such as not being able to access the network.");
+            System.out.println("Error Message:" + ce.getMessage());
+        } finally {
+            if (ossClient != null) {
+                ossClient.shutdown();
+            }
+        }
+
+        //文件访问路径规则 https://BucketName.Endpoint/ObjectName
+        StringBuilder stringBuilder = new StringBuilder("https://");
+        stringBuilder
+                .append(bucketName)
+                .append(".")
+                .append(endpoint)
+                .append("/")
+                .append(objectName);
+
+        log.info("文件上传到:{}", stringBuilder.toString());
+
+        return stringBuilder.toString();
+    }
+}
+```
+
+很显然，这个工具类仅完成了一件事，就是文件上传。
+
+❓️ 它有没有做什么？
+- 判断文件的类型 
+- 限制文件大小 
+- 校验文件内容 
+- 对文件名（objectName）进行过滤或规范化 
+
+也就是说，这个工具类本身是一个**纯功能实现**，而不是一个**安全实现**。
+
+🔎 这意味着什么？
+
+如果上层（controller）没有做额外校验，那么用户可以上传任意内容：
+- 可执行脚本文件（如 `.jsp`、`.html` 等）
+- 带有恶意内容的文件（如 XSS payload）
+- 超大文件（造成存储或带宽消耗）
+
+此外，`objectName` 由外部传入且未经过处理，也可能带来一些问题，例如：
+- 覆盖已有文件
+- 构造特殊路径（如目录穿越风格的命名）
+- 通过文件名直接影响访问 URL
+
+**另一个，关键问题是，这个工具类，本身是否有漏洞吗？是否会形成攻击链？**
+
+这取决于后续在controller / service层，它是怎样被提供给用户的。
+
+即后续需要重点关注：
+- **什么权限的用户可以调用该功能？**
+  - 一个比较危险的思路是，将后台操作者默认视为“可信对象”，认为只要工具类不直接暴露给普通用户，即使实现不安全也是可以接受的
+  - 实际上，即便只对后台开放，这类不安全的工具能力依然应该被修复，因为一旦发生越权或账号被利用，风险会被进一步放大
+- **调用处是否进行了文件上传校验？**
+  - 通常来说，即使在 controller / service 层根据业务需求存在不同的校验逻辑，在 utils 层也应具备一些基础的通用防护（如文件大小限制、文件名规范化等）
+  - 如果 utils 层完全没有任何限制，那么很可能上层也没有进行严格校验，这种情况需要重点关注
+- **上传后的文件是否可以被直接访问？**
+  - 在一些常见的小项目中（如用户头像、商品图片等场景），上传后的文件往往可以通过 URL 直接访问
+  - 如果上传内容未经过校验，这将可能导致 XSS，甚至在特定情况下形成进一步的攻击链（如结合前端渲染问题）
+
+
+❓️ **又一个问题，写了过滤就一定安全吗？**
+
+并非如此。做过渗透的小伙伴会知道，一些文件上传漏洞，恰恰就来源于——**“看起来做了过滤，但实际上过滤不充分”**。
+
+下面是几个常见的错误示例：
+
+**① 只通过后缀判断文件类型**
+```java
+if (!fileName.endsWith(".jpg")) {
+    throw new RuntimeException("只允许上传jpg图片");
+}
+````
+- 可以通过双后缀绕过：`shell.jsp.jpg`
+- 或大小写绕过：`shell.JPG`
+
+👉 本质问题：仅依赖字符串判断，不可靠
+
+**② 简单黑名单过滤**
+```java
+if (fileName.contains(".jsp") || fileName.contains(".php")) {
+    throw new RuntimeException("非法文件");
+}
+```
+- 依旧可以绕过：
+  - `shell.jsp;.jpg`
+  - `shell.jsp%00.jpg`
+  - `shell.jsp .jpg`
+
+👉 黑名单永远不完整
+
+**③ 只校验 Content-Type**
+```java
+if (!file.getContentType().equals("image/jpeg")) {
+    throw new RuntimeException("只允许上传图片");
+}
+```
+- Content-Type 可被伪造（例如使用burp suite篡改报文）
+- 攻击者可以上传任意文件并伪装为图片
+
+👉 本质：信任客户端数据
+>题外话，尝试使用burp suite拦截报文并修改，可以帮助我们更好的理解，哪些前端数据不可信，为什么不可信
+
+**④ 只检查文件头（但不完整）**
+```java
+byte[] bytes = file.getBytes();
+if (bytes[0] != (byte)0xFF || bytes[1] != (byte)0xD8) {
+    throw new RuntimeException("非法图片");
+}
+```
+- 只检查前几个字节，可以构造“图片马”
+- 后面仍然可以嵌入恶意代码
+
+**⑤ 文件名未规范化**
+```java
+ossUtil.upload(fileBytes, fileName);
+```
+- 攻击者可控 `fileName`
+- 可能导致：
+  - 覆盖文件
+  - 构造特殊路径
+  - 注入恶意URL
+
+📚 值得注意的是，大多数初学者自行编写的过滤逻辑往往并不可靠。
+
+在实际开发中，更推荐使用经过验证的成熟安全库来完成相关功能，例如：
+- 文件类型检测：
+  - `Apache Tika`（基于文件内容识别类型）
+  - `java.nio.file.Files.probeContentType()`
+- 文件上传安全处理：
+  - Spring 提供的 `MultipartFile` 配合服务端校验
+  - 结合白名单策略（允许的类型、大小等）
+
+在此基础上，仅针对具体业务需求进行必要的定制，而不是从零开始自行实现过滤逻辑。
+
+同时，即使使用成熟库，也应关注其使用方式是否正确，并结合实际场景进行审计。
+
+##### 3.5.2 HTML 过滤工具类
+
+本质上，这一类问题与文件上传类似，甚至可以类比密码算法的设计原则：
+
+👉 **涉及复杂规则的安全处理，应尽量使用经过验证的成熟实现，而不是自行编写（哪怕是AI写也不建议，AI只建议基于专业库写补充规则）。**
+
+在实际项目中，HTML 过滤通常存在以下三种情况：
+- **完全没有过滤机制**
+  - 这种情况下，需要重点关注 controller / service 层是否存在富文本相关功能（如评论、文章等），这些场景是 XSS 的高发区域
+  - 如果项目中没有涉及富文本，相对问题不大；如果存在，则需要进一步结合前端渲染方式一起分析
+- **手写过滤规则**
+  - 这种情况通常风险较高
+  - 常见问题包括：规则不完整、正则误用、未考虑绕过方式等
+  - 在审计时，可以将过滤逻辑交给大模型或工具辅助分析，快速定位潜在绕过点
+- **使用专业库或函数**
+  - 相对安全，但仍需关注是否存在误用
+  - 例如：配置不当、过滤策略过宽，或与业务逻辑存在冲突
+
+这里我也从简单到复杂，举几个手写HTML过滤规则被绕过的例子
+
+**① 只过滤 `<script>` 标签**
+```java
+content = content.replaceAll("<script>", "");
+content = content.replaceAll("</script>", "");
+```
+绕过方式：
+```html
+<ScRiPt>alert(1)</ScRiPt>
+<script src=//xss.com></script>
+<img src=x onerror=alert(1)>
+```
+问题：
+- 大小写绕过
+- 只过滤 script，忽略其他可执行标签
+
+**② 使用简单正则删除标签**
+```java
+content = content.replaceAll("<.*?>", "");
+```
+绕过方式：
+```html
+<<script>alert(1)//<</script>
+<scr<script>ipt>alert(1)</scr</script>ipt>
+```
+问题：
+- 正则无法正确解析嵌套HTML结构
+- 很容易被构造绕过
+
+**③ 只过滤关键字（黑名单）**
+```java
+if (content.contains("script")) {
+    throw new RuntimeException("非法内容");
+}
+```
+绕过方式：
+```html
+<scriPt>alert(1)</scriPt>
+<svg onload=alert(1)>
+<iframe src=javascript:alert(1)>
+```
+问题：
+- 黑名单不完整
+- HTML执行方式远不止 script
+
+**④ 只过滤事件属性（但不全面）**
+```java
+content = content.replaceAll("onerror", "");
+content = content.replaceAll("onload", "");
+```
+绕过方式：
+```html
+<img src=x oNerror=alert(1)>
+<svg oNlOad=alert(1)>
+```
+问题：
+- 大小写绕过
+- 事件种类很多（onclick、onmouseover 等）
+
+
+还有很多，比如错误过滤 javascript 协议，远不止这些。博客里所写的这些，并不是需要你逐条对照着看，只是讲解为什么过滤了也不行。
+真正审计的时候，还是推荐AI辅助来判断这一部分规则。
+
+一个复杂的例子是这样的。
+```java
+public class HTMLUtil {
+
+    /**
+     * 删除文章内的markdown
+     *
+     * @param source 需要过滤的文本
+     * @return 过滤后的内容
+     */
+    public static String deleteArticleTag(String source) {
+        //删除HTML和markdown标签
+        source = source.replaceAll("!\\[\\]\\((.*?)\\)", "").replaceAll("<[^>]+>", "");
+        return deleteTag(source);
+    }
+
+    /**
+     * 删除评论内容标签
+     *
+     * @param source 需要进行剔除HTML的文本
+     * @return 过滤后的内容
+     */
+    public static String deleteCommentTag(String source) {
+        //保留图片标签
+        source = source.replaceAll("(?!<(img).*?>)<.*?>", "");
+        return deleteTag(source);
+    }
+
+    /**
+     * 删除标签
+     *
+     * @param source 文本
+     * @return 过滤后的文本
+     */
+    private static String deleteTag(String source) {
+        //删除转义字符
+        source = source.replaceAll("&.{2,6}?;", "");
+        //删除script标签
+        source = source.replaceAll("<[\\s]*?script[^>]*?>[\\s\\S]*?<[\\s]*?\\/[\\s]*?script[\\s]*?>", "");
+        //删除style标签
+        source = source.replaceAll("<[\\s]*?style[^>]*?>[\\s\\S]*?<[\\s]*?\\/[\\s]*?style[\\s]*?>", "");
+        return source;
+    }
+}
+```
+❓️ 逐条比对去分析它？寻找绕过的可能？
+
+这是一件很复杂的事情，有些时候，开发者写的奇奇怪怪的过滤规则远不止这些。一条一条地去看正则是低效率的。
+当然，正则过滤其实本身就是一个信号——HTML不适合正则过滤，这意味着，使用正则过滤，很可能是不充分的。
+
+>PS:从编译原理的角度来说，HTML 属于包含嵌套结构的上下文无关文法，而正则表达式只能处理线性的正则文法。
+> 用低维的工具去解析高维的结构，在数学模型上就注定了会有无数的绕过漏洞。
+
+这个例子很显然看似过滤充分，但有许多绕过的可能：
+- `<scr<script>ipt>alert(1)</scr</script>ipt>`
+- `<<script>alert(1)//<</script>`
+- `<img src=x onerror=alert(1)>`
+- `<img src=1 onerror=fetch('/token')>`
+- `&#x3C;script&#x3E;alert(1)&#x3C;/script&#x3E;`
+- `<scr![]()ipt>alert(1)</script>`
+- ...
+
+在AI赋能的语义下，攻击者可以在短时间低成本内构造出大量的绕过方案。当然，你也可以通过AI辅助，分析出大量绕过的可能。
+
+👉 这个例子问题的本质在于：
+- 使用正则表达式处理 HTML（不可行）
+- 过滤顺序不合理（先删标签再删 script）
+- 仅关注标签，忽略属性（如 onerror）
+- 错误处理 HTML 实体（删除而非解析）
+- 黑名单策略不完整
+
+最后，推荐的方案是：
+- `OWASP Java HTML Sanitizer`
+- `jsoup.clean()`
+- `DOMPurify`（前端）
+
+
+##### 3.5.3 JwtUtil工具类
+
+这是一个典型的JwtUtil，观察这个代码，问题在哪里？
+
+```java
+public class JwtUtil {
+
+    private static final String KEY = "itheima";
+
+    //接收业务数据,生成token并返回
+    public static String genToken(Map<String, Object> claims) {
+        return JWT.create()
+                .withClaim("claims", claims)
+                .withExpiresAt(new Date(System.currentTimeMillis() + 1000 * 60 * 60 * 12))
+                .sign(Algorithm.HMAC256(KEY));
+    }
+
+    //接收token,验证token,并返回业务数据
+    public static Map<String, Object> parseToken(String token) {
+        return JWT.require(Algorithm.HMAC256(KEY))
+                .build()
+                .verify(token)
+                .getClaim("claims")
+                .asMap();
+    }
+}
+```
+首先，这段代码完成了两个功能：
+- 生成 Token
+- 校验 Token 并解析数据
+
+❓️ 从功能上来说是完整的，但它有没有做什么？
+- 密钥是否安全？
+- 是否支持密钥管理（如动态配置、轮换）
+- 是否区分不同 Token 类型（如用户 / 管理员）
+- 是否考虑 Token 失效控制（如主动失效、黑名单）
+
+**问题一：密钥硬编码**
+```java
+private static final String KEY = "itheima";
+````
+- 密钥直接写死在代码中，一旦源码泄露（如开源项目或代码外泄），攻击者可以自行伪造合法 Token
+- 密钥强度较低（弱密钥），存在被猜测或暴力破解的风险
+- （考虑到这是一个教学项目，这种写法可以理解，但在生产环境中，应使用高强度密钥，并通过配置或密钥管理系统进行管理，一般建议不少于 32 位）
+
+**问题二：Token 内容被完全信任**
+
+```java
+.withClaim("claims", claims)
+```
+
+- Token 中的业务数据被直接信任使用，但实际上诸如用户 ID、角色等关键字段，仍应在服务端进行校验（如结合数据库）
+- 一旦 KEY 泄露，攻击者可以随意构造 claims，从而伪造身份
+
+例如：
+
+```json
+{
+  "userId": 1,
+  "role": "admin"
+}
+```
+
+👉 如果后端直接基于这些字段进行权限判断，将导致严重的权限绕过问题
+
+**问题三：缺乏额外校验机制**
+
+```java
+JWT.require(Algorithm.HMAC256(KEY)).build().verify(token)
+```
+
+- 未校验 `issuer`（签发者）
+- 未校验 `audience`（受众）
+- 未对 Token 类型进行区分（如用户 / 管理员）
+
+这通常指向两种情况：
+
+- 一是系统仅设计了单一角色，这在大多数实际业务中是不合理的，也往往意味着权限模型设计存在缺陷
+- 二是系统存在多角色，但共用同一套 Token 机制，这种情况下更容易出现角色之间的越权问题
+
+**问题四：Token 无法主动失效**
+
+```java
+.withExpiresAt(...)
+```
+
+- 仅依赖过期时间（如 12 小时）控制 Token 生命周期
+- 无法支持：
+  - 用户主动登出
+  - 用户被封禁后立即失效
+
+👉 一旦 Token 泄露，在有效期内将持续可用
+
+**问题五：缺乏上下文绑定**
+
+Token 中未绑定任何上下文信息，例如：`IP`、`User-Agent`、设备标识等
+
+- 一旦 Token 被窃取，可以在任意环境中复用
+- 如果前端将 Token 存储在 Cookie 中，且后端缺乏 CSRF 防护机制，还可能放大 CSRF 攻击风险
+
+
+另外值得注意的一点是，这些审计和判断，是经验性的，并非绝对性的。这是因为不同的开发者，不同的公司，开发风格不同。
+
+举个例子:
+```java
+public class JwtUtil {
+    /**
+     * 生成jwt
+     * 使用Hs256算法, 私匙使用固定秘钥
+     *
+     * @param secretKey jwt秘钥
+     * @param ttlMillis jwt过期时间(毫秒)
+     * @param claims    设置的信息
+     * @return
+     */
+    public static String createJWT(String secretKey, long ttlMillis, Map<String, Object> claims) {
+        // 指定签名的时候使用的签名算法，也就是header那部分
+        SignatureAlgorithm signatureAlgorithm = SignatureAlgorithm.HS256;
+
+        // 生成JWT的时间
+        long expMillis = System.currentTimeMillis() + ttlMillis;
+        Date exp = new Date(expMillis);
+
+        // 设置jwt的body
+        JwtBuilder builder = Jwts.builder()
+                // 如果有私有声明，一定要先设置这个自己创建的私有的声明，这个是给builder的claim赋值，一旦写在标准的声明赋值之后，就是覆盖了那些标准的声明的
+                .setClaims(claims)
+                // 设置签名使用的签名算法和签名使用的秘钥
+                .signWith(signatureAlgorithm, secretKey.getBytes(StandardCharsets.UTF_8))
+                // 设置过期时间
+                .setExpiration(exp);
+
+        return builder.compact();
+    }
+
+    /**
+     * Token解密
+     *
+     * @param secretKey jwt秘钥 此秘钥一定要保留好在服务端, 不能暴露出去, 否则sign就可以被伪造, 如果对接多个客户端建议改造成多个
+     * @param token     加密后的token
+     * @return
+     */
+    public static Claims parseJWT(String secretKey, String token) {
+        // 得到DefaultJwtParser
+        Claims claims = Jwts.parser()
+                // 设置签名的秘钥
+                .setSigningKey(secretKey.getBytes(StandardCharsets.UTF_8))
+                // 设置需要解析的jwt
+                .parseClaimsJws(token).getBody();
+        return claims;
+    }
+
+}
+
+```
+
+❓️ 这段代码也和当一段出现了同样多的问题吗？
+
+⭐ 绝大多数是的。但是有两点没有，这个项目之中，
+- 一是，可以看见的是密钥没有硬编码
+- 二是，是做了不同角色的区分。
+
+❓️ 为什么第二点，这段代码里面没有？
+
+✳️ 因为被开发者放到拦截器里面去了。因此具体的，看有关JWT的设计，我们有时候还需要关注一下拦截器，过滤器，甚至是切面（AOP）。
+仅根据一个包，或者一层就下定论，有些时候容易误判。
+```java
+@Component
+@Slf4j
+public class JwtTokenAdminInterceptor implements HandlerInterceptor {
+
+    @Autowired
+    private JwtProperties jwtProperties;
+
+    /**
+     * 校验jwt
+     *
+     * @param request
+     * @param response
+     * @param handler
+     * @return
+     * @throws Exception
+     */
+    @Override
+    public boolean preHandle(HttpServletRequest request, HttpServletResponse response, Object handler)
+            throws Exception {
+        // 判断当前拦截到的是Controller的方法还是其他资源
+        if (!(handler instanceof HandlerMethod)) {
+            // 当前拦截到的不是动态方法，直接放行
+            return true;
+        }
+
+        // 1、从请求头中获取令牌
+        String token = request.getHeader(jwtProperties.getAdminTokenName());
+
+        // 2、校验令牌
+        try {
+            log.info("jwt校验:{}", token);
+            Claims claims = JwtUtil.parseJWT(jwtProperties.getAdminSecretKey(), token);
+            Long empId = Long.valueOf(claims.get(JwtClaimsConstant.EMP_ID).toString());
+            BaseContext.setCurrentId(empId);
+            // 3、通过，放行
+            return true;
+        } catch (Exception ex) {
+            // 4、不通过，响应401状态码
+            response.setStatus(401);
+            return false;
+        }
+    }
+}
+```
+
+##### 3.5.4 其他常见的工具类
+
+- **加密工具类**  
+  一些初学者会将加密相关逻辑直接封装在 utils 中，这一部分需要重点关注算法的选择与使用方式。
+
+  - 是否使用了不安全的哈希算法（如 MD5、SHA1）
+  - 是否存在明文存储敏感信息的情况
+  - 是否正确使用了加盐（salt）机制
+
+  👉 对于需要持久化存储的敏感信息（如密码），通常建议使用更安全的哈希算法，例如：`bcrypt`、`scrypt`、`argon2` 等
+
+  👉 在条件允许的情况下，可以进一步引入“胡椒（pepper）”机制，提高整体安全性
+
+- **支付工具类**  
+  这类工具通常直接涉及资金与核心业务安全，其重要性不言而喻。
+
+  常见需要关注的问题包括：
+
+  - 是否校验支付金额（是否由服务端计算，而非信任前端）
+  - 是否验证订单状态（防止重复支付、越权支付）
+  - 是否校验回调来源（防止伪造支付回调）
+
+  👉 由于这一部分涉及业务逻辑较多，后续会单独作为一节进行分析
+
+- **HTTP 请求工具类（如调用第三方接口）**  
+  一些项目会封装 HTTP 请求工具（如基于 `HttpClient`、`RestTemplate`、`OkHttp`），用于调用外部接口。
+
+  需要关注：
+
+  - 请求 URL 是否可控（可能导致 SSRF）
+  - 是否限制访问内网地址（如 127.0.0.1、169.254.169.254 等）
+  - 是否存在重定向跟随问题
+
+  👉 如果 URL 来源于用户输入且未做限制，可能形成 SSRF 漏洞
+
+- **验证码 / 随机数工具类**  
+  常用于登录、注册、找回密码等场景。
+
+  需要关注：
+
+  - 是否使用安全的随机数生成器（如 `SecureRandom`）
+  - 是否存在可预测的验证码（如时间戳、简单递增）
+  - 验证码是否有过期时间与次数限制
+
+  👉 弱随机数或无校验机制，可能导致验证码被爆破或预测
+
+- **ID 生成工具类（如雪花算法等）**  
+  用于生成订单号、用户ID等。
+
+  需要关注：
+  - ID 是否可预测（如自增ID）
+  - 是否被直接用于权限判断（如通过ID访问资源）
+
+  👉 如果 ID 可预测，可能导致数据枚举或越权访问
+
+- **日期 / 时间工具类**  
+  常用于订单、活动、权限控制等场景。
+
+  需要关注：
+  - 是否依赖客户端时间
+  - 是否存在时间判断逻辑错误（如过期判断不严格）
+
+  👉 可能影响权限控制或业务逻辑（如提前/延后执行）
+
+- **日志工具类（或日志封装）**  
+  一些项目会对日志进行统一封装。
+
+  需要关注：
+  - 是否记录敏感信息（如密码、Token）
+  - 是否存在日志注入问题（如未过滤用户输入）
+
+  👉 日志往往被忽略，但一旦泄露，影响范围较大
+
+
+>总体来说，这些工具类的共同特点是：
+>**它们本身不一定直接产生漏洞，但会影响系统是否具备某种“可被利用的能力”。**
+
+>对于一些值得细讲的工具类，之后我找到好的样例后，会在这一小节之中进行拓展。也欢迎各位大佬提供一些有趣的样例。 
 
 #### 3.6 Controller 层业务审计（用户可访问的接口入口）
 
