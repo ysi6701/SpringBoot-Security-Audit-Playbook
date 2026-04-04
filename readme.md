@@ -21,10 +21,40 @@
 
 > **如何在拿到源码后，从 0 开始进行一次完整的 Java 代码审计。**
 
+---
+
 📌 本文适合：
 
 - 刚接触代码审计，不知道从哪里下手的初学者
 - 具备一定开发经验，希望从安全角度重新理解项目的开发者
+
+---
+
+⭐ 你需要的前置知识：
+
+在阅读本文之前，不需要具备非常深入的安全或开发经验，但具备以下基础会更容易理解：
+
+- **基本的 Web 漏洞知识**  
+  例如：XSS、CSRF、文件上传漏洞、SQL 注入（SQLi）、SSRF 等
+
+- **基本的 Java 语法**  
+  能够看懂类、方法、参数传递，以及简单的业务逻辑
+
+- **基本的 SpringBoot 结构**  
+  了解 controller / service / mapper（dao） 的基本分层
+
+- **基础的后端安全常识**  
+  例如：认证与授权的区别、敏感数据不应明文存储、不要信任前端输入等  
+
+- **基本的数据库访问方式（MyBatis / JDBC）**
+  - 了解 SQL 是如何被构造和执行的
+  - 知道预编译（PreparedStatement）与字符串拼接的区别  
+
+📌 如果以上内容有部分不熟悉，也不影响阅读，可以在遇到具体问题时再补充学习。
+
+👋 本文更偏“带你走一遍审计流程”，而不是对每一个漏洞进行深入讲解。
+
+---
 
 >**特别提醒**：本文内容主要讲述的是一种审计的“起步方式”，并不代表代码审计的全部内容。
 >这也意味着，完成文中所有步骤，并不能保证项目绝对安全。具体情况仍需根据不同业务场景进行分析。
@@ -347,24 +377,161 @@ sky-take-out-main
 
 > 一个典型的例子是审计日志（这里指系统自身记录的操作日志）：相关信息（如操作人）的填充，可能是在 AOP 中统一完成的，而不是直接出现在 controller 或 service 层。因此，不能仅凭这两层代码中“没有体现”就判断审计日志存在缺失。
 
-#### 3.2 全局配置与安全基线（配置类）
+### 3.2 全局配置与安全基线（配置类）
 
 
 
 
 
-#### 3.3 认证与权限机制（登录接口 + 权限控制代码）
+### 3.3 认证与权限机制（登录接口 + 权限控制代码）
 
 
-#### 3.4 数据库与数据安全（DAO层 / Mapper / Repository）
+### 3.4 数据库与数据安全（DAO层 / Mapper / Repository）
+
+谈到数据库，值得令我们关注的，就是数据库注入问题。我们暂且以三种案例进行讨论：
+
+**（1）MyBatis**
+
+在使用 MyBatis 时，从审计角度来看，应重点关注参数绑定方式：
+
+- `#{}`：表示预编译参数绑定（PreparedStatement），**安全**
+- `${}`：表示字符串拼接，**存在 SQL 注入风险**
+
+✅ 正确使用方式：
+```java
+@Select("SELECT * FROM address_book WHERE id = #{id}")
+````
+
+❌ 错误使用方式：
+```java
+@Select("SELECT * FROM address_book ORDER BY ${column}")
+```
+`${}` 会将参数直接拼接进 SQL，如果参数来源于用户输入，则可能导致 SQL 注入。
+
+一般情况下，项目中应尽量避免使用 `${}`。但需要注意的是，在 `ORDER BY` 场景中：
+
+- 字段名无法使用 `#{}` 绑定
+- **只能使用 `${}` 进行拼接**
+
+因此，这种场景应该尤为关注：
+- `${}` 的参数是否来源于用户输入
+- 是否对字段值做了限制（如白名单）
+- 是否存在直接透传参数的情况
+
+安全的使用是（白名单限制）：
+
+```java
+public String getOrderByColumn(String column) {
+    List<String> whitelist = Arrays.asList("id", "name", "create_time");
+    if (whitelist.contains(column)) {
+        return column;
+    }
+    return "id";
+}
+```
+
+```java
+@Select("SELECT * FROM address_book ORDER BY ${column}")
+List<AddressBook> list(@Param("column") String column);
+```
+
+```java
+String safeColumn = getOrderByColumn(userInput);
+mapper.list(safeColumn);
+```
 
 
-#### 3.5 工具类（文件上传 / HTML过滤 / JWT等）
+**(2) Mybatis Plus**
+
+SQL风险相对更少但值得注意：
+
+**① Wrapper 条件拼接不当**
+
+一般情况下，像下面这种写法是安全的：
+```java
+LambdaQueryWrapper<User> wrapper = new LambdaQueryWrapper<>();
+wrapper.eq(User::getId, id);
+userMapper.selectList(wrapper);
+```
+
+这是因为`eq()`中的参数会作为预编译参数处理，不会直接拼接进 SQL。
+但如果开发者错误地把用户输入当作 SQL 片段使用，就可能出现风险。例如：
+```java
+QueryWrapper<User> wrapper = new QueryWrapper<>();
+wrapper.last("limit " + userInput);
+userMapper.selectList(wrapper);
+```
+
+`last()`的内容会被直接拼接到 SQL 语句末尾，不会进行参数预编译。
+如果`userInput`可控，则可能带来 SQL 注入问题。
+
+**② 使用`apply()`、`inSql()`、`exists()`等方法时直接拼接参数**
+
+MyBatis Plus 提供了一些用于拼接原生 SQL 片段的方法，这些方法在审计中应重点关注：
+- `last()`
+- `apply()`
+- `inSql()`
+- `notInSql()`
+- `exists()`
+- `notExists()`
+
+例如下面的写法就存在风险：
+
+```java
+QueryWrapper<User> wrapper = new QueryWrapper<>();
+wrapper.apply("date_format(create_time,'%Y-%m-%d') = '" + userInput + "'");
+userMapper.selectList(wrapper);
+```
+
+**③ 动态条件可能带来的逻辑绕过问题**
+
+除了传统意义上的 SQL 注入外，MyBatis Plus 还需要关注一种比较常见的问题：动态条件控制不严，导致查询逻辑被绕过。
+
+```java
+LambdaQueryWrapper<User> wrapper = new LambdaQueryWrapper<>();
+wrapper.eq(User::getStatus, 1);
+
+if (StringUtils.isNotBlank(name)) {
+    wrapper.like(User::getName, name);
+}
+```
+这种写法本身不一定会导致 SQL 注入，但如果业务中过于依赖前端传参控制查询条件，就可能出现：
+- 原本应限制的数据范围被放宽
+- 某些查询条件缺失后返回全部数据
+- 通过构造特殊参数绕过业务过滤逻辑
+
+**④ 与 MyBatis 混用时，手写 SQL 仍然存在 ${} 风险**
+
+这一点参考（1）的部分
+
+
+**(3) 预编译**
+
+一个误区是使用了预编译就一定没有SQL注入的风险，原因在于一些开发者可能误用预编译，导致为预编译
+
+```java
+            String sql = "update book set book_id='"+val1+"', "
+                    + "stock='"+val2+"' where book_id='"+val1+"'";
+            ps = con.prepareStatement(sql);
+```
+
+在这个案例之中，虽然使用了`prepaStatement`，但是sql语句本身还是拼接的。
+
+安全的使用是
+```java
+        String sql = "select * from student where student_id=?";
+        try {
+            ps = con.prepareStatement(sql);
+            ps.setString(1, txtsid.getText());
+            rs = ps.executeQuery();
+```
+
+### 3.5 工具类（文件上传 / HTML过滤 / JWT等）
 
 在这一步里，我来举几个开源教学项目之中最常出现的漏洞。分析存在漏洞的写法和安全的写法（或说修复方案）
 
 
-##### 3.5.1 文件上传
+#### 3.5.1 文件上传
 
 这是一个基于阿里OSS的文件上传工具类，观察这个代码，问题在哪里？
 
@@ -543,7 +710,7 @@ ossUtil.upload(fileBytes, fileName);
 
 同时，即使使用成熟库，也应关注其使用方式是否正确，并结合实际场景进行审计。
 
-##### 3.5.2 HTML 过滤工具类
+#### 3.5.2 HTML 过滤工具类
 
 本质上，这一类问题与文件上传类似，甚至可以类比密码算法的设计原则：
 
@@ -702,7 +869,7 @@ public class HTMLUtil {
 - `DOMPurify`（前端）
 
 
-##### 3.5.3 JwtUtil工具类
+#### 3.5.3 JwtUtil工具类
 
 这是一个典型的JwtUtil，观察这个代码，问题在哪里？
 
@@ -914,7 +1081,7 @@ public class JwtTokenAdminInterceptor implements HandlerInterceptor {
 }
 ```
 
-##### 3.5.4 其他常见的工具类
+#### 3.5.4 其他常见的工具类
 
 - **加密工具类**  
   一些初学者会将加密相关逻辑直接封装在 utils 中，这一部分需要重点关注算法的选择与使用方式。
