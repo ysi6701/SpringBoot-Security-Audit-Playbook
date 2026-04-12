@@ -1250,5 +1250,171 @@ public String test(String name) {
 在存在漏洞版本的 log4j-core 下，就可能被利用
 
 
+#### 3.7.2 反序列化漏洞
 
 
+
+**第一步：分析“反序列化入口”**
+
+核心思想是：
+> ❗ 所有“把字符串 / 字节 → 对象”的地方都要看
+
+🔍 Fastjson 相关入口
+
+✔ 常见方法有
+```java
+JSON.parseObject(json)
+JSON.parseObject(json, Object.class)
+JSON.parse(json)
+JSON.parseArray(json)
+```
+一些比较危险的写法比如
+
+❗ ① 通用解析（高风险）：类型不固定，可能触发 autoType / 绕过
+```java
+Object obj = JSON.parseObject(json, Object.class);
+Object obj = JSON.parse(json);
+```
+⚠️ ② 不明确类型：
+```java
+JSONArray arr = JSON.parseArray(json);
+```
+🔎 Jackson 入口
+
+```java
+objectMapper.readValue(json, Xxx.class)
+```
+一些比较危险的写法比如
+
+❗ ① 通用类型
+```java
+objectMapper.readValue(json, Object.class);
+```
+❗ ② 多态类型
+```java
+objectMapper.enableDefaultTyping()
+```
+开启后：
+```java
+readValue(json, BaseClass.class)
+```
+❗ 可能被利用
+
+🔍 原生 Java（高危）入口
+```java
+ObjectInputStream.readObject()
+```
+✔ 最经典反序列化漏洞入口
+
+✔ 直接高危
+
+
+🔍 工具类封装
+```java
+JsonUtil.parse(json)
+```
+内部可能写的不安全：
+```java
+return JSON.parseObject(json);
+```
+因此必须全局搜索调用链
+
+🔍 JSONReader
+```java
+JSONReader reader = new JSONReader(...);
+reader.readObject();
+```
+🔍 其他框架还有：
+* Hessian
+* XStream
+* Kryo
+
+
+**第二步：看“数据来源”**
+
+> 漏洞成立的前提 = 数据可控
+
+一些常见来源：
+
+| 来源              | 风险 |
+| --------------- | - |
+| HTTP 参数 / Body  |  高 |
+| Header / Cookie |  高 |
+| WebSocket       |  高 |
+| 文件上传            | 高 |
+| 数据库 / Redis     | 中 |
+| 第三方接口           |  中 |
+| 内部常量            | 低 |
+
+📌 一些危险的示例
+
+```java
+String json = request.getParameter("data");
+JSON.parseObject(json, Object.class);
+```
+
+```java
+String json = httpClient.doGet(url);
+JSON.parseObject(json);
+```
+
+如果数据来源于外部，则需要判断是否可控
+
+**第三步：看“解析方式”**
+
+✔ 安全写法：明确类型，不触发 autoType
+```java
+User user = JSON.parseObject(json, User.class);
+```
+
+× 危险写法：通用反序列化
+
+```java
+Object obj = JSON.parseObject(json, Object.class);
+```
+
+**第四步：看配置（Fastjson / Jackson）**
+
+⚠️ **Fastjson**高危配置：
+```java
+ParserConfig.getGlobalInstance().setAutoTypeSupport(true);
+```
+```java
+JSON.parseObject(json, Object.class, Feature.SupportAutoType);
+```
+宽松白名单
+```java
+ParserConfig.getGlobalInstance().addAccept("com.xxx.");
+```
+
+⚠️ **Jackson**高危配置：
+```java
+objectMapper.enableDefaultTyping();
+```
+或：
+```java
+objectMapper.activateDefaultTyping(...)
+```
+**第五步：关注依赖版本**
+
+📌 Fastjson
+
+| 版本       | 风险   |
+| -------- | ---- |
+| < 1.2.83 | 存在绕过 |
+| ≥ 1.2.83 | ✔ 安全 |
+
+📌 Jackson
+
+* 关注 databind 历史漏洞
+* 重点不是版本，而是配置（DefaultTyping）
+
+
+**第六步：看是否存在 Gadget（利用链）**
+
+常见依赖有：
+* commons-collections
+* commons-beanutils
+* groovy
+* spring-core
+* JdbcRowSetImpl（JDK）
