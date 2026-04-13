@@ -381,8 +381,6 @@ sky-take-out-main
 
 
 
-
-
 ### 3.3 认证与权限机制（登录接口 + 权限控制代码）
 
 
@@ -1418,3 +1416,77 @@ objectMapper.activateDefaultTyping(...)
 * groovy
 * spring-core
 * JdbcRowSetImpl（JDK）
+
+#### 3.7.3 JNDI
+
+审计JNDI，首先需要理解JNDI是什么。
+
+通俗而言是： 应用给出一个“名字” ，JNDI 帮它去某个命名/目录服务里把对应资源找出来 ，这些资源可能是数据源、EJB、LDAP 条目、RMI 对象引用之类
+
+>PS: 3.7.1 中提到的 Log4j 漏洞，本质上并不是 “Log4j 本身就是 JNDI”，而是 Log4j 的某些 lookup 机制可触发 JNDI 解析，从而导致攻击面。
+
+
+在企业 Java 里，它经常出现在这些场景：
+- DataSource 查找
+- LDAP 目录查询和认证
+- 应用服务器资源注入
+- 通过 RMI / LDAP / CORBA 等命名服务取对象
+
+于是，当不可信输入能够影响 JNDI 的查找名、协议、目标地址或返回对象处理方式时，就可能把普通查询变成危险行为。
+
+像SQLi，反序列漏洞，以及包括JNDI等注入问题的本质就在于：不可信数据进入解释器或敏感处理流程。
+
+从审计角度看，这类问题的核心仍然是：不可信输入是否进入了敏感处理流程。因此重点关注两部分：
+- ⭐用户可控输入
+- ⭐命名解析、目录查询、对象获取等危险入口。
+
+那么危险的入口有哪些呢？例如：
+
+```java
+InitialContext
+Context
+DirContext
+InitialDirContext
+lookup(
+search(
+bind(
+rebind(
+createSubcontext(
+getAttributes(
+```
+其中最为值得关注的地方比如
+```java
+new InitialContext(...)
+new InitialDirContext(...)
+ctx.lookup(...)
+dirContext.search(...)
+```
+
+在问题代码之中可能出现的形式比如
+```java
+String jndiName = prefix + userInput;
+ctx.lookup(jndiName);
+```
+再比如
+```java
+Hashtable env = new Hashtable();
+env.put(Context.PROVIDER_URL, url);
+new InitialDirContext(env);
+```
+```java
+DirContext ctx = new InitialDirContext(env);
+ctx.search(baseDn, filter, controls);
+```
+```java
+DataSource ds = (DataSource) ctx.lookup(jndiName);
+```
+
+那么在刚开始学习审计的时候，其实这对于我们来说，了解所有的风险函数是相当困难的。
+但从这个漏洞的原理来看，一种更为舒适的动手方法是：关注那些不可信的输入来源，分析这些来源在后续是否进入到了某个敏感处理或执行流程之中。
+
+如果不知道这个后续敏不敏感怎么办？我考虑分为两种情况：
+- 调用了某个你不清楚的函数，这个时候很简单，你可以很方便地使用AI查询这个函数在干什么
+- 使用了某个自己封装的工具类，这个时候，你需要进入调用链，分析底层究竟干了什么，调用了什么函数，遇到不知道的库函数依据上一条来处理
+
+
+#### 3.7.4 Shiro反序列化
