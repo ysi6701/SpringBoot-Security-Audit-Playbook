@@ -1248,9 +1248,7 @@ public String test(String name) {
 在存在漏洞版本的 log4j-core 下，就可能被利用
 
 
-#### 3.7.2 反序列化漏洞
-
-
+#### 3.7.2 反序列化
 
 **第一步：分析“反序列化入口”**
 
@@ -1417,7 +1415,7 @@ objectMapper.activateDefaultTyping(...)
 * spring-core
 * JdbcRowSetImpl（JDK）
 
-#### 3.7.3 JNDI
+#### 3.7.3 JNDI 
 
 审计JNDI，首先需要理解JNDI是什么。
 
@@ -1490,3 +1488,145 @@ DataSource ds = (DataSource) ctx.lookup(jndiName);
 
 
 #### 3.7.4 Shiro反序列化
+
+
+首先需要在依赖树之中关注shiro的版本，如果<=1.2.4，且项目之中还在使用rememberMe的话。那就很糟糕了。
+在这些版本下，AES加密时采用的key是硬编码在代码中的（公开常量），这意味着攻击者非常容易伪造rememberMe进行攻击。
+
+建议优先升级至官方已修复安全问题的最新稳定版本（如 1.12+ 或 2.x），并结合安全配置。
+
+当然，shiro版本在1.2.4以上，不意味着是没有问题的。需要结合正确的cipherKey配置（显式设置强随机 cipherKey + 必要时关闭 RememberMe），才是安全的。
+
+例如版本较新，但是cipherKey仍为默认或弱密钥，依旧不那么安全。
+
+攻击者可以构造恶意序列化对象，并使用已知/猜测的 cipherKey 加密后写入 rememberMe Cookie，从而触发反序列化执行任意代码。
+
+
+具体的，我们以一个shiro配置类为例进行分析
+
+```java
+package com.example.shirodemo.config;
+
+import org.apache.shiro.mgt.SecurityManager;
+import org.apache.shiro.spring.security.interceptor.AuthorizationAttributeSourceAdvisor;
+import org.apache.shiro.spring.web.ShiroFilterFactoryBean;
+import org.apache.shiro.web.mgt.CookieRememberMeManager;
+import org.apache.shiro.web.mgt.DefaultWebSecurityManager;
+import org.apache.shiro.web.servlet.SimpleCookie;
+import org.springframework.aop.framework.autoproxy.DefaultAdvisorAutoProxyCreator;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+
+import java.util.Base64;
+import java.util.LinkedHashMap;
+import java.util.Map;
+
+@Configuration
+public class ShiroConfig {
+
+    @Bean
+    public ShiroFilterFactoryBean shiroFilterFactoryBean(SecurityManager securityManager) {
+        ShiroFilterFactoryBean shiroFilterFactoryBean = new ShiroFilterFactoryBean();
+        shiroFilterFactoryBean.setSecurityManager(securityManager);
+
+        shiroFilterFactoryBean.setLoginUrl("/login");
+        shiroFilterFactoryBean.setUnauthorizedUrl("/unauthorized");
+
+        Map<String, String> filterChainDefinitionMap = new LinkedHashMap<>();
+        filterChainDefinitionMap.put("/login", "anon");
+        filterChainDefinitionMap.put("/logout", "anon");
+        filterChainDefinitionMap.put("/static/**", "anon");
+        // 正确做法：使用 "authc" 要求必须登录（推荐移除 RememberMe 后使用）
+        filterChainDefinitionMap.put("/**", "authc");
+
+        shiroFilterFactoryBean.setFilterChainDefinitionMap(filterChainDefinitionMap);
+        return shiroFilterFactoryBean;
+    }
+
+    @Bean
+    public SecurityManager securityManager() {
+        DefaultWebSecurityManager securityManager = new DefaultWebSecurityManager();
+        securityManager.setRealm(myRealm());
+
+        // ✅ 正确做法：如果业务不需要记住我功能，直接移除 RememberMeManager
+
+        // ❌ 错误/风险配置：
+        // securityManager.setRememberMeManager(rememberMeManager());  // 容易忘记配置密钥
+
+        return securityManager;
+    }
+
+    @Bean
+    public MyRealm myRealm() {
+        return new MyRealm();
+    }
+
+    /**
+     *  正确的 RememberMe 配置（如果业务确实需要）
+     * 必须显式设置强随机 cipherKey
+     */
+    // @Bean   // ← 如果不需要 RememberMe，请直接删除整个方法
+    public CookieRememberMeManager rememberMeManager() {
+        CookieRememberMeManager cookieRememberMeManager = new CookieRememberMeManager();
+
+        // ✅ 正确：使用强随机密钥（生产环境必须这样做）
+        // 推荐方式：每次部署时通过 SecureRandom 生成新密钥，并配置到配置文件中
+        //把 cipherKey 放到 application.yml 中，通过 @Value 注入，避免硬编码在 Java 类里。
+        byte[] cipherKey = Base64.getDecoder().decode("你的强随机Base64密钥至少32字节推荐");
+        cookieRememberMeManager.setCipherKey(cipherKey);
+
+        // ✅ 推荐：自定义 Cookie 名称，降低指纹识别风险
+        SimpleCookie cookie = new SimpleCookie("REMEMBER_ME");
+        cookie.setHttpOnly(true);
+        cookie.setMaxAge(86400 * 7);   // 7天，根据业务调整
+        cookieRememberMeManager.setCookie(cookie);
+
+        return cookieRememberMeManager;
+    }
+
+    // AOP 支持
+    @Bean
+    public DefaultAdvisorAutoProxyCreator defaultAdvisorAutoProxyCreator() {
+        DefaultAdvisorAutoProxyCreator creator = new DefaultAdvisorAutoProxyCreator();
+        creator.setProxyTargetClass(true);
+        return creator;
+    }
+
+    @Bean
+    public AuthorizationAttributeSourceAdvisor authorizationAttributeSourceAdvisor(SecurityManager securityManager) {
+        AuthorizationAttributeSourceAdvisor advisor = new AuthorizationAttributeSourceAdvisor();
+        advisor.setSecurityManager(securityManager);
+        return advisor;
+    }
+}
+```
+补充：在不使用 RememberMe 的情况下，建议还是全局搜索一下 `RememberMe` 相关配置（包括 RememberMeManager、setRememberMe、CookieRememberMeManager 等），以避免出现开发者主观上不打算使用，但实际上在配置或代码路径中仍然启用了 RememberMe 的情况。
+
+另一点值得补充的是，并不是存在 Shiro 反序列化风险点，就一定能够形成可以利用的完整攻击链。
+
+可以用一个比较直观的类比来理解：
+
+假设一个没有拿斧头的攻击者，目标是闯入房子里，用斧头把桌子砸坏。  
+Shiro 的反序列化问题，本质上相当于**给攻击者打开了一扇门**，但攻击能否真正发生，还取决于另一个关键条件：
+
+👉 **屋子里有没有“斧头”可以用。**
+
+这里的“斧头”，就是反序列化利用所依赖的 **gadget 链**（例如 commons-collections 等）。
+
+更准确地说：
+- Shiro RememberMe 提供的是一个**可控反序列化入口**
+- 是否能进一步利用（例如 RCE）
+- 取决于 classpath 中是否存在**可利用的 gadget**
+
+但值得注意的是：
+> ❗ 即便当前环境中不存在可用的 gadget 链，这个问题依然不应该被忽略。
+
+原因在于：
+- 项目依赖是动态变化的
+- 后续开发中**很可能引入新的第三方库**
+- 一旦引入可利用 gadget，这个原本“不可利用”的风险点就会**立即转变为可利用漏洞**
+
+
+因此，更合理的处理方式是：
+
+👉 将其视为一个**潜在高风险入口点**，在审计或整改阶段就进行修复，而不是等到可利用条件齐备。
