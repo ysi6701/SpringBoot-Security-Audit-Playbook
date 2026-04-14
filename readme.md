@@ -384,6 +384,17 @@ sky-take-out-main
 ### 3.3 认证与权限机制（登录接口 + 权限控制代码）
 
 
+3.3.1 JWT
+
+
+3.3.2 cookie / sessionid
+
+
+3.3.3 shiro
+
+3.3.4 just password??
+
+
 ### 3.4 数据库与数据安全（DAO层 / Mapper / Repository）
 
 谈到数据库，值得令我们关注的，就是数据库注入问题。我们暂且以三种案例进行讨论：
@@ -1160,6 +1171,269 @@ public class JwtTokenAdminInterceptor implements HandlerInterceptor {
 
 ### 3.6 Controller 层业务审计（用户可访问的接口入口）
 
+🚧 施工中
+
+#### 3.6.1 水平越权
+
+#### 3.6.2 垂直越权
+
+
+
+#### 3.6.x 微信支付回调
+
+支付回调，并不能够简单地当做一个回调接口来看待，而是要当做一个资金链路状态来看待。
+在这一小节里面，我们以微信支付回调为例子进行分析。
+
+PS：很显然，直接跟钱有关的业务逻辑，肯定是非常重要的。
+
+❓️ 首先，我们清楚一个问题，微信支付回调是在干什么。
+
+>即：微信发来一条通知，告诉你（商家），这笔订单已经被支付了，于是你的系统对应的修改订单状态为被支付了。比如用户付钱了，我们可以发货/送餐了。
+
+⚠️ 这里有一个关键点：不是“收到回调就更新状态”，而是“校验通过后再更新状态”。
+
+因此问题就很显然，我们得回答几个问题：
+
+- 🤔发过来这条消息的人，是微信吗？——系统有没有给别人伪造这条消息的可能？有没有可能是支付宝，是银行发回的回调？
+- 🤔微信发来的这条消息，支付结果到底是什么？ ——是成功还是失败？系统有没有对返回状态做严格校验？
+- 🤔这个支付结果，是属于我这个商户的吗？——appid、mchid 是否匹配？有没有可能是其他商户的数据被重放？
+- 🤔支付金额是否正确？ ——我 15 RMB 的商品，实际到账是否也是 15 RMB，而不是 0.1 RMB？
+- 🤔幂等做好了没有？——同一笔支付回调多次通知时，系统是否只会处理一次？我重放这个报文，让商家发一百个🍔给我吃？
+
+PS：回调本质 = 不可信输入 + 资金状态变更入口
+
+
+因此正常的逻辑（伪码），至少要是这个样子的
+
+```java
+@PostMapping("/pay/wechat/notify")
+public ResponseEntity<String> notify(HttpServletRequest request) {
+    String body = readRawBody(request);
+
+    try {
+        // ==============================
+        // ❓问题1：发消息的人，真的是微信吗？
+        // ==============================
+        // 1. 验证通知真实性（签名 + 平台证书）
+        NotifyMeta meta = notifyVerifier.verify(request, body);
+
+        // ==============================
+        // 解密核心数据
+        // ==============================
+        WechatPayNotifyData notifyData = notifyDecryptor.decrypt(body);
+
+        // ==============================
+        // ❓问题2：支付结果到底是什么？
+        // ==============================
+        if (!"TRANSACTION.SUCCESS".equals(notifyData.getEventType())) {
+            return fail();
+        }
+        if (!"SUCCESS".equals(notifyData.getTradeState())) {
+            return fail();
+        }
+
+        // ==============================
+        // ❓问题3：是不是我的订单？（商户校验）
+        // ==============================
+        if (!config.getMchId().equals(notifyData.getMchId())) {
+            log.warn("mchid not match");
+            return fail();
+        }
+        if (!config.getAppId().equals(notifyData.getAppId())) {
+            log.warn("appid not match");
+            return fail();
+        }
+
+        // ==============================
+        // 查询本地订单（避免信任外部数据）
+        // ==============================
+        Order order = orderService.getByOrderNo(notifyData.getOutTradeNo());
+        if (order == null) {
+            log.error("order not exist, outTradeNo={}", notifyData.getOutTradeNo());
+            return fail();
+        }
+
+        // ==============================
+        // ❓问题4：金额是否正确？
+        // ==============================
+        if (!order.getAmount().equals(notifyData.getAmount().getTotal())) {
+            log.error("amount not match, orderAmount={}, notifyAmount={}",
+                    order.getAmount(), notifyData.getAmount().getTotal());
+            return fail();
+        }
+
+        // ==============================
+        // ❓问题5：幂等处理（防重复回调）
+        // ==============================
+        // 推荐：在 service 层通过状态机 or 唯一约束保证幂等
+        paymentNotifyService.handleWechatPaySuccess(order, notifyData);
+
+        // ==============================
+        // 告知微信处理成功
+        // ==============================
+        return success();
+
+    } catch (RepeatNotifyProcessedException e) {
+        // 幂等：已处理过，直接返回成功（非常关键）
+        return success();
+
+    } catch (Exception e) {
+        log.error("wechat pay notify handle failed", e);
+        return fail();
+    }
+}
+```
+
+因此，对照上面的结构，如果存在缺失的验证逻辑，就会产生对应的安全问题。
+
+❓️ 有了上述的结构就一定安全？
+
+当然不是的。
+
+进而我们再看其中的细节，主要看验签的部分（其他的部分，和一般业务逻辑的审计具有相似之处，这里就不再多说了）
+
+我们重复一遍，验签在干的事情，就是验证发来这条消息的人是微信，而不是其他的，意料之外的人。
+
+首先
+```
+签名 = f(时间 + 随机数 + 报文)
+
+String message = timestamp + "\n" + nonce + "\n" + body + "\n";
+```
+拿到这个签名之后，我们要用用微信的公钥，验证这个 f(...) 是不是微信算出来的
+
+以一个例子来说明常见的验签逻辑：
+```java
+public NotifyMeta verify(HttpServletRequest request, String body) {
+
+    // 1. 取 header
+    String signature = request.getHeader("Wechatpay-Signature");
+    String timestamp = request.getHeader("Wechatpay-Timestamp");
+    String nonce = request.getHeader("Wechatpay-Nonce");
+    String serial = request.getHeader("Wechatpay-Serial");
+
+    // 2. 基础校验
+    assertNotEmpty(signature, timestamp, nonce, serial);
+
+    // 3. 时间窗口校验(用于防重放，但有些时候这个防重放的功能是通过幂等做的)
+    checkTimestamp(timestamp);
+
+    // 4. 构造签名原文
+    String message = timestamp + "\n" + nonce + "\n" + body + "\n";
+
+    // 5. 获取微信公钥（通过 serial）
+    PublicKey publicKey = certificateManager.getPublicKey(serial);
+
+    // 6. RSA 验签
+    boolean valid = rsaVerify(publicKey, message, signature);
+
+    if (!valid) {
+        throw new SecurityException("invalid signature");
+    }
+
+    return new NotifyMeta(serial, timestamp, nonce);
+}
+```
+那么问题可能出在哪里呢？
+
+**① 调用了验签，但是不关心验签结果**
+```java
+notifyVerifier.verify(request, body);
+// true or fasle? no care——>继续往下走
+paymentNotifyService.handleWechatPaySuccess(notifyData);
+```
+像这样只是捕获异常也是的
+```java
+try {
+    notifyVerifier.verify(request, body);
+} catch (Exception e) {
+    log.warn("verify failed", e);
+}
+
+// 验签结果仅仅只影响了日志，但是没有影响业务逻辑——>继续处理
+paymentNotifyService.handleWechatPaySuccess(notifyData);
+```
+
+**② 不校验时间戳**
+```java
+// 完全没有时间窗口校验
+notifyVerifier.verify(request, body);
+```
+攻击者抓到一条真实回调——>几天后再次发送——>验签完全通过 ✅
+
+**③ 忽略 serial，使用固定公钥**
+```java
+PublicKey publicKey = loadLocalPublicKey(); // 写死的
+
+rsaVerify(publicKey, message, signature);
+```
+👉 微信平台证书是会轮换的，不更换会导致错误信任旧证书，以及新证书全部失败
+
+**④ 只要“解密成功”就当作合法**
+```java
+WechatPayNotifyData notifyData = notifyDecryptor.decrypt(body);
+
+// 认为已经安全
+paymentNotifyService.handleWechatPaySuccess(notifyData);
+```
+这个还真有一个糟糕的例子
+```java
+    /**
+     * 支付成功回调
+     *
+     * @param request
+     */
+    @RequestMapping("/paySuccess")
+    public void paySuccessNotify(HttpServletRequest request, HttpServletResponse response) throws Exception {
+        // 读取数据
+        String body = readData(request);
+        log.info("支付成功回调：{}", body);
+
+        // 数据解密
+        String plainText = decryptData(body);
+        log.info("解密后的文本：{}", plainText);
+
+        JSONObject jsonObject = JSON.parseObject(plainText);
+        String outTradeNo = jsonObject.getString("out_trade_no");// 商户平台订单号
+        String transactionId = jsonObject.getString("transaction_id");// 微信支付交易号
+
+        log.info("商户平台订单号：{}", outTradeNo);
+        log.info("微信支付交易号：{}", transactionId);
+
+        // 业务处理，修改订单状态、来单提醒
+        orderService.paySuccess(outTradeNo);
+
+        // 给微信响应
+        responseToWeixin(response);
+    }
+
+```
+❓发生了什么？
+
+整个流程只做了一件事：
+
+👉 解密成功 → 直接当作合法订单处理
+
+也就是说：
+- ❌ 没有验签（不知道是不是微信发的）
+- ❌ 没有校验数据是否被篡改
+- ❌ 没有任何来源可信判断
+
+实际效果就是： 任何人只要构造一份“能被解密”的数据，就可以触发你的业务逻辑
+
+当然这并不是最大的问题，在这个例子里面，甚至订单被记录为合法这个操作是在解密之前。开发者从设计上就没有“验签”这个概念
+
+另外，题外话，这个代码的另一个问题是，把完整支付报文（甚至是解密后的敏感信息）直接打到日志，其实是不合适的。
+```java
+log.info("支付成功回调：{}", body);
+log.info("解密后的文本：{}", plainText);
+```
+这在生产环境中通常是不合适的，可能带来：
+- 敏感数据泄露（订单信息、用户信息）
+- 合规风险（尤其是金融/支付场景）
+
+PS:很不幸运的是，这个项目的设计之中，还有不太恰当的权限管理，进一步放大了这个不起眼的问题，形成了完整的数据泄露攻击链。
+
 
 ### 3.7 一些典型的，值得一提的方向
 
@@ -1630,3 +1904,7 @@ Shiro 的反序列化问题，本质上相当于**给攻击者打开了一扇门
 因此，更合理的处理方式是：
 
 👉 将其视为一个**潜在高风险入口点**，在审计或整改阶段就进行修复，而不是等到可利用条件齐备。
+
+
+
+
