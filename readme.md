@@ -1204,6 +1204,214 @@ public class JwtTokenAdminInterceptor implements HandlerInterceptor {
 
 #### 3.6.1 水平越权
 
+首先我们来看什么是水平越权。举个简单的例子，在外卖场景下，小明只能访问自己的订单，这显然是正常逻辑；但如果小明能够访问小红的订单，那么这里就出现了水平越权。
+
+这种问题究竟是怎么出现的？很多人会以为，需要通过某种“非常炫酷”的漏洞利用技巧，才能做到水平越权。
+
+事实上并没有那么复杂。绝大多数情况下，这类漏洞只是因为开发者没有明确区分鉴别（Authentication）和授权（Authorization）导致。
+
+下面看一个典型例子。用户登录点单系统后，系统会对 JWT 进行校验，然后用户查看自己的订单详情：
+
+```java
+/**
+ * 查询订单详情
+ *
+ * @param id
+ * @return
+ */
+@GetMapping("/orderDetail/{id}")
+public Result<OrderVO> details(@PathVariable("id") Long id) {
+    OrderVO orderVO = orderService.details(id);
+    return Result.success(orderVO);
+}
+```
+
+```java
+/**
+ * 查询订单详情
+ *
+ * @param id
+ * @return
+ */
+public OrderVO details(Long id) {
+    // 根据id查询订单
+    Orders orders = orderMapper.getById(id);
+
+    // 查询该订单对应的菜品/套餐明细
+    List<OrderDetail> orderDetailList = orderDetailMapper.getByOrderId(orders.getId());
+  ...
+```
+
+问题出在哪里？
+
+乍一看似乎没有任何问题。
+
+用户已经登录，JWT 也完成了校验，这说明访问者确实是一个合法用户；合法用户访问合法订单，好像逻辑完全正确。
+
+但问题在于：这个订单真的属于当前用户吗？
+
+如果我使用一个合法用户 A 的身份，去访问另一个合法用户 B 的订单 B，这段逻辑能够阻止吗？WAF 或其他安全设备能够拦截吗？
+
+很显然，不能。
+
+因为这里仅仅完成了“身份是否合法”的鉴别，却没有完成“资源是否属于该身份”的授权校验。
+
+那这个问题严重吗？
+
+如果只是看看别人今天吃了什么，好像问题不算特别大。
+
+PS：实际上，这类问题依然严重，本质上属于用户数据泄露风险，可能违反数据保护或合规要求，即便表面看似只是“查看他人订单”，也可能涉及隐私侵权或法律合规问题。
+
+但换一个业务场景，问题立刻就会变得非常严重。
+
+例如地址簿：
+
+```java
+@GetMapping("/{id}")
+public Result<AddressBook> getById(@PathVariable Long id) {
+    AddressBook addressBook = addressBookService.getById(id);
+    return Result.success(addressBook);
+}
+```
+
+```java
+/**
+ * 根据id查询
+ *
+ * @param id
+ * @return
+ */
+public AddressBook getById(Long id) {
+    AddressBook addressBook = addressBookMapper.getById(id);
+    return addressBook;
+}
+```
+
+在正常逻辑下，用户查看自己的地址簿当然没有问题；但由于业务逻辑没有校验该地址簿是否属于当前用户，于是任何人都可以遍历访问其他用户的地址信息。
+
+于是就会出现一个非常荒诞的场景：系统明明没有 SQL 注入（SQLi），但攻击者却依然能够通过 ID 遍历的方式，对敏感数据进行“脱库”。
+
+而且，如果攻击者稍微谨慎一点，比如更换代理、控制请求频率，那么系统甚至可能在很长时间内都无法发现异常；前提还是对方真的有人在维护防火墙，而不是完全依赖自动化策略。
+
+还有别的危险场景吗？
+
+当然有。
+
+例如，我们可以“友善”地替别人催单：
+
+```java
+/**
+ * 用户催单
+ *
+ * @param id
+ * @return
+ */
+@GetMapping("/reminder/{id}")
+public Result<String> reminder(@PathVariable("id") Long id) {
+    orderService.reminder(id);
+    return Result.success();
+}
+```
+
+```java
+/**
+ * 用户催单
+ *
+ * @param id
+ */
+public void reminder(Long id) {
+    // 查询订单是否存在
+    Orders orders = orderMapper.getById(id);
+    if (orders == null) {
+        throw new OrderBusinessException(MessageConstant.ORDER_NOT_FOUND);
+    }
+
+    // 基于WebSocket实现催单
+    Map<String, Object> map = new HashMap<>();
+    map.put("type", 2);// 2代表用户催单
+    map.put("orderId", id);
+    map.put("content", "订单号：" + orders.getNumber());
+    webSocketServer.sendToAllClient(JSON.toJSONString(map));
+}
+```
+
+甚至可以随心所欲地取消别人的订单，别吃了减肥：
+
+```java
+/**
+ * 用户取消订单
+ *
+ * @return
+ */
+@PutMapping("/cancel/{id}")
+public Result<String> cancel(@PathVariable("id") Long id) throws Exception {
+    orderService.userCancelById(id);
+    return Result.success();
+}
+```
+
+```java
+/**
+ * 取消订单
+ *
+ * @param ordersCancelDTO
+ */
+public void cancel(OrdersCancelDTO ordersCancelDTO) throws Exception {
+    // 根据id查询订单
+    Orders ordersDB = orderMapper.getById(ordersCancelDTO.getId());
+
+    // 支付状态
+    Integer payStatus = ordersDB.getPayStatus();
+    if (payStatus == 1) {
+        // 用户已支付，需要退款
+      ...
+    }
+
+    // 管理端取消订单需要退款，根据订单id更新订单状态、取消原因、取消时间
+    Orders orders = new Orders();
+    orders.setId(ordersCancelDTO.getId());
+    orders.setStatus(Orders.CANCELLED);
+    orders.setCancelReason(ordersCancelDTO.getCancelReason());
+    orders.setCancelTime(LocalDateTime.now());
+    orderMapper.update(orders);
+}
+```
+
+So, why did it happen?
+
+正如前面所说，本质原因在于开发者混淆了鉴别（Authentication）与授权（Authorization）。
+
+这两个词虽然看起来很像，但实际含义完全不同。
+
+在很多开发者的理解里：
+
+“我已经做了登录校验，所以这是合法用户；既然是合法用户，那自然就可以访问资源。”
+
+于是就产生了这种典型的对象级访问越权（Broken Object Level Authorization，BOLA）。
+
+通常情况下，像 insert 新记录这类操作，开发者一般还会记得从 ThreadLocal 中取出当前用户的 UserId（通常是在 JWT 校验完成后写入的），因此问题不大。
+
+——毕竟这种场景下，如果不传 UserId，数据甚至都插不进去。
+
+但在 update、delete、select 这类场景中，很多开发者往往只根据资源 ID 操作数据，而不会继续校验“该资源是否属于当前用户”，于是就出现了上面这种“只校验 productId，不校验 userId”的问题。
+
+正确的逻辑应该是：
+
+```sql
+select * 
+from product_table 
+where userid = #{userid} 
+  and productid = #{productid};
+```
+
+而不是：
+
+```sql
+select * 
+from product_table 
+where productid = #{productid};
+```
+
 #### 3.6.2 垂直越权
 
 
