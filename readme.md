@@ -384,7 +384,330 @@ sky-take-out-main
 ### 3.3 认证与权限机制（登录接口 + 权限控制代码）
 
 
-3.3.1 JWT
+#### 3.3.1 JWT
+
+我们首先来分析JWT（JSON Web Token）的结构。JWT主要由三个部分组成，每部分使用 Base64Url 编码后以`.`分隔
+```
+<Header>.<Payload>.<Signature>
+```
+- 头部 (header)用于描述令牌元信息，包括签名算法和令牌类型。典型示例如下：
+```json
+{
+  "alg": "HS256",
+  "typ": "JWT"
+}
+```
+- 载荷 (payload)包含实际要传递的信息，是 JWT 的核心部分，主要包括：
+    - 注册声明（Registered Claims）：标准字段，如
+        - iss（Issuer）签发者
+        - sub（Subject）主题，通常为用户唯一标识
+        - aud（Audience）接收方
+        - exp（Expiration Time）过期时间
+        - nbf（Not Before）生效时间
+        - iat（Issued At）签发时间
+        - jti（JWT ID）唯一标识符
+- 公共声明（Public Claims）：应用可自定义字段，用于存放角色、权限、部门 ID 等信息。
+- 私有声明（Private Claims）：完全由应用定义的字段，用于携带业务特定信息，如用户偏好、单点登录标识等。
+
+
+- 签名（signature）主要由一下公式来声明，从算法上来看，很明显，这个是为了防篡改，以及完整性的。
+```
+Signature = HMACSHA256( base64UrlEncode(Header) + "." + base64UrlEncode(Payload), secret )
+```
+签名部分是JWT做无状态认证的关键，服务器无需保存任何会话的信息，只需要把header+payload丢进签名算法里面，然后比对和签名是否一致就行为了。
+
+我们依据这个结构来一次回答上面的问题：
+- JWT能够提供哪些安全保障？
+    - 身份认证：通过载荷中的`sub`等身份标识符来确认请求者的身份 
+    - 数据完整性校验：篡改载荷之中的字段，会导致后面的签名校验不通过
+    - 权限控制：But✳这个不是天然就能够做的，需要在公共声明部分定义比如role一类的权限信息，系统才能够依赖这个做资源授权控制。
+    - 无状态安全管理：即上面说的仅依赖 JWT 本身即可完成认证与授权，实现安全的分布式访问。
+- JWT提供安全保障的前提是什么？
+    - ⭐ 其实，你也发现了，JWT token几乎所有的部分，都是由用户报文提供了，仅有secret（密钥）是秘密。那么很显然，JWT的安全性几乎完全依赖于secret。这要求：
+        - secret不适用弱密钥，不硬编码，最好还需要轮换
+    - ⭐  另外，很显然JWT的header和payload仅仅进行了base64编码，并没有加密，因此，绝对不要再这两个部分放隐私数据，比如密码，以及其他的不应该泄露的数据。
+    - ⭐ 其实，你也发现了一点，在JWT验证的过程之中，我们只看了token本身，没有看任何其他的东西。这意味着，不管是谁拿着A同学的token，系统都会认为此人是合法的A，并为之提供A的服务。所以，聪明的你发现了，JWT其实不防中间人攻击。需要在HTTPS或者其他安全通道使用。
+
+下面也提供了一段JWT的生成代码，可以结合代码看看原理。
+```java
+@Service
+public class JwtService {
+
+    // 建议把它放到配置文件里，存 Base64 编码后的强随机密钥
+    @Value("${jwt.secret}")
+    private String secret;
+
+    private SecretKey getKey() {
+        return Keys.hmacShaKeyFor(Decoders.BASE64.decode(secret));
+    }
+
+    public String generateToken(String username, List<String> roles) {
+        Instant now = Instant.now();
+
+        return Jwts.builder()
+                .subject(username)
+                .claim("roles", roles)
+                .issuedAt(Date.from(now))
+                .expiration(Date.from(now.plus(2, ChronoUnit.HOURS)))
+                .signWith(getKey())
+                .compact();
+    }
+
+    public Claims parseToken(String token) {
+        return Jwts.parser()
+                .verifyWith(getKey())
+                .build()
+                .parseSignedClaims(token)
+                .getPayload();
+    }
+
+    public boolean isValid(String token, String username) {
+        Claims claims = parseToken(token);
+        return username.equals(claims.getSubject())
+                && claims.getExpiration().after(new Date());
+    }
+}
+```
+
+从原理的角度出发了之后，我们在再看实际中的问题案例
+
+##### 第一关：只做了解码，没有验签
+```java 
+@Component
+public class JwtUtil {
+
+    public String getUsername(String token) throws Exception {
+        String[] parts = token.split("\\.");
+        String payloadJson = new String(
+                Base64.getUrlDecoder().decode(parts[1]),
+                StandardCharsets.UTF_8
+        );
+
+        ObjectMapper mapper = new ObjectMapper();
+        JsonNode payload = mapper.readTree(payloadJson);
+
+        return payload.get("sub").asText();
+    }
+
+    public List<String> getRoles(String token) throws Exception {
+        String[] parts = token.split("\\.");
+        String payloadJson = new String(
+                Base64.getUrlDecoder().decode(parts[1]),
+                StandardCharsets.UTF_8
+        );
+
+        ObjectMapper mapper = new ObjectMapper();
+        JsonNode payload = mapper.readTree(payloadJson);
+
+        List<String> roles = new ArrayList<>();
+        payload.get("roles").forEach(node -> roles.add(node.asText()));
+        return roles;
+    }
+}
+```
+
+```java
+@GetMapping("/admin/users")
+public String adminApi(@RequestHeader("Authorization") String authHeader) throws Exception {
+    String token = authHeader.substring(7);
+    List<String> roles = JwtUtil.getRoles(token);
+
+    if (roles.contains("ADMIN")) {
+        return "管理员接口数据";
+    }
+    throw new ResponseStatusException(HttpStatus.FORBIDDEN);
+}
+```
+在这个例子里面，服务器拿到token，只对header和payload部分做了解码，拿出了里面的role，但是没有进行验签。在这种情况下，用户随意地篡改token之中地userid，role等参数，服务器都会为之提供服务。
+```
+Signature = HMACSHA256( base64UrlEncode(Header) + "." + base64UrlEncode(Payload), secret )
+```
+
+
+
+##### 第二关：虽然验签了，但没有校验`exp`/`iss`/`aud`
+```java
+@Service
+public class JwtValidationService {
+
+    @Value("${jwt.secret}")
+    private String secret;
+
+    private SecretKey getKey() {
+        return Keys.hmacShaKeyFor(Decoders.BASE64.decode(secret));
+    }
+
+    public boolean isValid(String token) {
+        Claims claims = Jwts.parser()
+                .verifyWith(getKey())
+                .build()
+                .parseSignedClaims(token)
+                .getPayload();
+
+        // 只要 sub 不为空就算合法
+        return claims.getSubject() != null;
+    }
+}
+```
+这将导致：
+- 过期 token 可能仍被接受；
+- 别的系统签发的 token 可能被误接受；
+- 原本签发给系统 A 的 token，可能在系统 B 被错误使用。
+
+改进地写法是，比如你可以手动校验一下
+```java
+@Service
+public class BetterJwtValidationService {
+
+    @Value("${jwt.secret}")
+    private String secret;
+
+    @Value("${jwt.issuer}")
+    private String expectedIssuer;
+
+    @Value("${jwt.audience}")
+    private String expectedAudience;
+
+    private SecretKey getKey() {
+        return Keys.hmacShaKeyFor(Decoders.BASE64.decode(secret));
+    }
+
+    public boolean isValid(String token) {
+        Claims claims = Jwts.parser()
+                .verifyWith(getKey())
+                .build()
+                .parseSignedClaims(token)
+                .getPayload();
+
+        Date now = new Date();
+
+        if (claims.getExpiration() == null || claims.getExpiration().before(now)) {
+            return false;
+        }
+
+        if (!expectedIssuer.equals(claims.getIssuer())) {
+            return false;
+        }
+
+        Object aud = claims.get("aud");
+        if (aud == null || !aud.toString().contains(expectedAudience)) {
+            return false;
+        }
+
+        return claims.getSubject() != null;
+    }
+}
+```
+或者像spring security之中的写法
+```java
+@Configuration
+@EnableMethodSecurity
+public class SecurityConfig {
+
+    @Bean
+    SecurityFilterChain securityFilterChain(HttpSecurity http) throws Exception {
+        return http
+                .authorizeHttpRequests(auth -> auth
+                        .requestMatchers("/public/**").permitAll()
+                        .anyRequest().authenticated()
+                )
+                .oauth2ResourceServer(oauth2 -> oauth2.jwt())
+                .build();
+    }
+
+    @Bean
+    JwtDecoder jwtDecoder() {
+        NimbusJwtDecoder decoder =
+                (NimbusJwtDecoder) JwtDecoders.fromIssuerLocation("https://idp.example.com/issuer");
+
+        OAuth2TokenValidator<Jwt> withIssuer = JwtValidators.createDefaultWithIssuer(
+                "https://idp.example.com/issuer"
+        );
+
+        OAuth2TokenValidator<Jwt> audienceValidator =
+                new JwtClaimValidator<List<String>>("aud", aud ->
+                        aud != null && aud.contains("order-service"));
+
+        decoder.setJwtValidator(new DelegatingOAuth2TokenValidator<>(withIssuer, audienceValidator));
+        return decoder;
+    }
+}
+```
+
+##### 第三关：把敏感数据塞到payload里面去了
+
+```java
+public String generateToken(User user) {
+    return Jwts.builder()
+            .subject(user.getUsername())
+            .claim("phone", user.getPhone())
+            .claim("idCard", user.getIdCard())
+            .claim("passwordHash", user.getPassword()) // 严重错误
+            .claim("salary", user.getSalary())
+            .issuedAt(new Date())
+            .expiration(Date.from(Instant.now().plus(2, ChronoUnit.HOURS)))
+            .signWith(getKey())
+            .compact();
+}
+```
+这个问题很显然，JWT的载荷之中时绝不应该放敏感数据的，因为这个地方本身没有加密。 HMACSHA256在这里只提供签名的作用。
+
+##### 第四关：不当的密钥
+按照我们上面所说的，secret时JWT安全的关键。secret是JWT安全的必要不充分条件。
+
+因此不应该：
+
+❌ 硬编码弱密钥
+```
+private static final String SECRET = "jwt-secret";
+```
+
+❌ 把普通字符串直接 getBytes()
+```
+private SecretKey getKey() {
+    return Keys.hmacShaKeyFor("mysecret123456".getBytes(StandardCharsets.UTF_8));
+}
+```
+
+##### 第五关：超长的有效期
+
+```java
+public String generateToken(String username, List<String> roles) {
+    Instant now = Instant.now();
+
+    return Jwts.builder()
+            .subject(username)
+            .claim("roles", roles)
+            .issuedAt(Date.from(now))
+            .expiration(Date.from(now.plus(30, ChronoUnit.DAYS))) // 30天过长
+            .signWith(getKey())
+            .compact();
+}
+```
+这种设计的问题在于，长期不失效的token，会增加token泄露之后被重复的风险。
+假设这个时候，设计之中还没有吊销机制，那就更可怕了。我们可怜的安全人员，只能够通过改JWT相关代码逻辑，改secret来阻止攻击者了（当然这通常并不合适）。
+
+##### 第六关：缺乏吊销机制
+
+这里实际上存在一个逻辑漏洞。
+
+例如，当用户执行注销操作时，理论上应该无法继续访问系统。但由于 JWT 是无状态的，它本身并不记录用户的注销行为。这就意味着，即便用户已经注销，若手中仍持有有效的 JWT，通过签名验证和解码，该 token 仍然可以正常使用系统。换句话说，用户并没有真正完成“注销”。
+
+因此，安全的做法是必须引入 token 吊销机制。常见实现方式是通过 Redis + 黑名单：将已注销的 token 写入黑名单，在每次请求验证之前，先检查该 token 是否在黑名单中即可。同时，需要定期清理 Redis 中已经过期的 token，以避免存储冗余。
+
+审计时的关注点在于：用户执行 logout 后，系统是否真正吊销了 token，防止未授权访问。
+
+##### 第七关：错误的复用
+
+这个问题不常见，但在开发规范不严谨的情况下容易出现：
+- 跨子系统复用同一 JWT 逻辑与 secret：对多个不同子系统使用同一套 JWT 签发和验证逻辑，并复用相同的 secret。
+    - 除非是统一认证平台，否则不推荐这种做法。否则用户持有一个子系统的 token，就可能在其他子系统中随意访问。
+
+- 不同角色复用同一 JWT 逻辑与 secret，且缺失 role 字段
+    - 用户持有普通用户 token 即可访问管理员接口，这是严重安全漏洞。
+    - 原则上，同一套逻辑和 secret 下，必须包含 role 或权限字段；若不设置 role，则至少应使用不同 secret 区分不同权限账户。
+
+总结来说，JWT 的安全性不仅依赖于签名算法，还取决于设计的隔离与吊销策略。缺乏这些措施，将导致 token 被错误使用或权限越权。
 
 
 3.3.2 cookie / sessionid
